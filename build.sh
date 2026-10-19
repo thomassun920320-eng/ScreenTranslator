@@ -73,6 +73,7 @@ if [ ! -f "$SIGN_KC" ]; then
   openssl pkcs12 -export -legacy -inkey "$TMPC/key.pem" -in "$TMPC/cert.pem" -out "$TMPC/id.p12" -passout "pass:$P12PASS" 2>/dev/null \
     || openssl pkcs12 -export -inkey "$TMPC/key.pem" -in "$TMPC/cert.pem" -out "$TMPC/id.p12" -passout "pass:$P12PASS"
   security create-keychain -p "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC"
+  chmod 600 "$SIGN_KC"
   security set-keychain-settings "$SIGN_KC"
   security unlock-keychain -p "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC"
   security import "$TMPC/id.p12" -k "$SIGN_KC" -P "$P12PASS" -T /usr/bin/codesign >/dev/null
