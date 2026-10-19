@@ -5,6 +5,7 @@ import CoreGraphics
 import Carbon
 import ScreenCaptureKit
 import Security
+import ServiceManagement
 
 // MARK: - 1. 設定與翻譯引擎模型
 enum TranslationEngine: String, CaseIterable, Identifiable {
@@ -765,6 +766,9 @@ struct PreferencesView: View {
 
     private var generalTab: some View {
         Form {
+            Section("啟動") {
+                LaunchAtLoginRow()
+            }
             Section("觸發") {
                 SettingRow(symbol: "command", color: .gray, title: "全域快捷鍵") {
                     Picker("", selection: $settings.hotkeyPreset) { ForEach(HotkeyPreset.allCases) { p in Text(p.rawValue).tag(p.rawValue) } }.labelsHidden().fixedSize()
@@ -893,6 +897,35 @@ struct PreferencesView: View {
     }
 }
 
+// MARK: - 5.4 開機自動啟動（登入時開啟）
+final class LaunchAtLogin: ObservableObject {
+    static let shared = LaunchAtLogin()
+    @Published private(set) var isEnabled = SMAppService.mainApp.status == .enabled
+    @Published private(set) var needsApproval = SMAppService.mainApp.status == .requiresApproval
+
+    func set(_ enabled: Bool) {
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch { appLog("登入時啟動設定失敗：\(error.localizedDescription)") }
+        refresh()
+        if enabled && needsApproval { SMAppService.openSystemSettingsLoginItems() }
+    }
+
+    func refresh() {
+        let status = SMAppService.mainApp.status
+        isEnabled = status == .enabled; needsApproval = status == .requiresApproval
+        appLog("登入時啟動狀態：\(status.rawValue)")
+    }
+
+    // 1.1.4 第一次啟動時預設開啟，之後尊重使用者在偏好設定中的選擇
+    func enableByDefaultOnce() {
+        let flag = "launchAtLoginDefaulted_v6"
+        guard !UserDefaults.standard.bool(forKey: flag) else { refresh(); return }
+        UserDefaults.standard.set(true, forKey: flag)
+        if SMAppService.mainApp.status != .enabled { set(true) } else { refresh() }
+    }
+}
+
 // MARK: - 5.5 權限管理
 // 每秒檢查一次權限狀態：輔助使用一允許就立即生效；螢幕錄製若仍需重開，提供一鍵重新啟動。
 final class PermissionManager: ObservableObject {
@@ -955,6 +988,22 @@ final class PermissionManager: ObservableObject {
         task.arguments = ["-c", "sleep 0.6; /usr/bin/open '\(path)'"]
         try? task.run()
         NSApp.terminate(nil)
+    }
+}
+
+struct LaunchAtLoginRow: View {
+    @ObservedObject var login = LaunchAtLogin.shared
+    var body: some View {
+        SettingRow(symbol: "power", color: .green, title: "登入時自動啟動") {
+            HStack(spacing: 8) {
+                if login.needsApproval {
+                    Button("到系統設定允許") { SMAppService.openSystemSettingsLoginItems() }.controlSize(.small)
+                }
+                Toggle("", isOn: Binding(get: { login.isEnabled || login.needsApproval }, set: { login.set($0) }))
+                    .labelsHidden().toggleStyle(.switch)
+            }
+        }
+        .onAppear { login.refresh() }
     }
 }
 
@@ -1030,6 +1079,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupGlobalHotkeyMonitors()
         OCREngine.shared.warmUp()
+        LaunchAtLogin.shared.enableByDefaultOnce()
         SettingsManager.shared.migrateKeychainKeysIfNeeded()
         let permissions = PermissionManager.shared
         permissions.onAccessibilityGranted = { [weak self] in self?.installEventTap() }
