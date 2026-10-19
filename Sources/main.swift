@@ -59,6 +59,12 @@ enum TranslationEngine: String, CaseIterable, Identifiable {
     static var aiEngines: [TranslationEngine] { [.gemini, .openai, .ollama] }
 }
 
+enum OverlayStyle: String, CaseIterable, Identifiable {
+    case inPlace = "原地取代"
+    case label = "深色標籤"
+    var id: String { rawValue }
+}
+
 enum HotkeyPreset: String, CaseIterable, Identifiable {
     case fnC = "Fn + C"
     case optC = "Option (⌥) + C"
@@ -107,7 +113,9 @@ class SettingsManager: ObservableObject {
     @AppStorage("ollamaEndpoint_v4") var ollamaEndpoint: String = "http://localhost:11434"
     @AppStorage("ollamaModel_v4") var ollamaModel: String = "qwen2.5:7b"
 
-    @AppStorage("overlayOpacity_v4") var overlayOpacity: Double = 0.88
+    // 1.1.3 改為原地取代樣式，預設完全不透明才能蓋住原文，因此換新的設定鍵
+    @AppStorage("overlayOpacity_v5") var overlayOpacity: Double = 1.0
+    @AppStorage("overlayStyle_v5") var overlayStyle: String = OverlayStyle.inPlace.rawValue
     @AppStorage("minTextConfidence_v4") var minTextConfidence: Double = 0.5
 
     @Published var testStatus: String = "貼上金鑰後，點擊「測試連線」確認是否可用"
@@ -140,11 +148,76 @@ class SettingsManager: ObservableObject {
 }
 
 // MARK: - 2. 辨識與翻譯資料結構
+struct RGB: Sendable, Equatable {
+    var r: Double, g: Double, b: Double
+    static let white = RGB(r: 1, g: 1, b: 1), black = RGB(r: 0, g: 0, b: 0)
+    var luminance: Double { 0.2126 * r + 0.7152 * g + 0.0722 * b }
+    var color: Color { Color(red: r, green: g, blue: b) }
+}
+
 struct OCRTextBox: Identifiable, Sendable {
     let id = UUID()
     let originalText: String
     var translatedText: String
     let normalizedRect: CGRect
+    var background: RGB = .black // 原文周圍的背景色
+    var foreground: RGB = .white // 原文的文字顏色
+}
+
+// 螢幕截圖的 RGBA 像素，用來取樣原文的背景色與文字色，讓譯文能「原地取代」
+struct PixelBuffer {
+    let data: [UInt8]; let width: Int; let height: Int; let bytesPerRow: Int
+
+    init?(_ image: CGImage) {
+        let w = image.width, h = image.height, rowBytes = w * 4
+        var bytes = [UInt8](repeating: 0, count: rowBytes * h)
+        let ok = bytes.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: rowBytes,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h)); return true
+        }
+        guard ok else { return nil }
+        data = bytes; width = w; height = h; bytesPerRow = rowBytes
+    }
+
+    // 以左上為原點的像素座標
+    func pixel(_ x: Int, _ y: Int) -> RGB {
+        let cx = min(max(x, 0), width - 1), cy = min(max(y, 0), height - 1)
+        let i = cy * bytesPerRow + cx * 4
+        return RGB(r: Double(data[i]) / 255, g: Double(data[i + 1]) / 255, b: Double(data[i + 2]) / 255)
+    }
+
+    /// Vision 的正規化座標（原點在左下）→ 取樣背景色與文字色
+    func colors(for norm: CGRect) -> (background: RGB, foreground: RGB) {
+        let x0 = Int(norm.minX * Double(width)), x1 = Int(norm.maxX * Double(width))
+        let y0 = Int((1 - norm.maxY) * Double(height)), y1 = Int((1 - norm.minY) * Double(height))
+        guard x1 > x0, y1 > y0 else { return (.black, .white) }
+        let pad = max(2, (y1 - y0) / 6)
+
+        // 背景：取框外一圈像素的中位數
+        var ring: [RGB] = []
+        let stepX = max(1, (x1 - x0) / 60), stepY = max(1, (y1 - y0) / 12)
+        for x in stride(from: x0 - pad, through: x1 + pad, by: stepX) { ring.append(pixel(x, y0 - pad)); ring.append(pixel(x, y1 + pad)) }
+        for y in stride(from: y0, through: y1, by: stepY) { ring.append(pixel(x0 - pad, y)); ring.append(pixel(x1 + pad, y)) }
+        func median(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] }
+        let bg = RGB(r: median(ring.map(\.r)), g: median(ring.map(\.g)), b: median(ring.map(\.b)))
+
+        // 文字：框內與背景差異最大的前 15% 像素平均
+        var inside: [(RGB, Double)] = []
+        let sx = max(1, (x1 - x0) / 80), sy = max(1, (y1 - y0) / 16)
+        for y in stride(from: y0, to: y1, by: sy) {
+            for x in stride(from: x0, to: x1, by: sx) {
+                let p = pixel(x, y)
+                inside.append((p, abs(p.r - bg.r) + abs(p.g - bg.g) + abs(p.b - bg.b)))
+            }
+        }
+        inside.sort { $0.1 > $1.1 }
+        let top = inside.prefix(max(1, inside.count * 15 / 100))
+        var fg = RGB(r: top.map(\.0.r).reduce(0, +) / Double(top.count), g: top.map(\.0.g).reduce(0, +) / Double(top.count), b: top.map(\.0.b).reduce(0, +) / Double(top.count))
+        // 對比太低（例如反鋸齒或取樣失敗）時，改用黑或白確保看得清楚
+        if abs(fg.luminance - bg.luminance) < 0.35 { fg = bg.luminance > 0.5 ? RGB(r: 0.1, g: 0.1, b: 0.12) : .white }
+        return (bg, fg)
+    }
 }
 
 // MARK: - 3. 翻譯服務 (含 503 自動重試與智慧降級)
@@ -425,11 +498,14 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hant", "zh-Hans", "ko-KR"]
         do { try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request]) }
         catch { appLog("OCR 失敗：\(error.localizedDescription)"); return [] }
+        let pixels = PixelBuffer(cgImage)
         return (request.results ?? []).compactMap { obs in
             guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { return nil }
             let text = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard text.count > 1, text.rangeOfCharacter(from: .letters) != nil else { return nil }
-            return OCRTextBox(originalText: text, translatedText: text, normalizedRect: obs.boundingBox)
+            var box = OCRTextBox(originalText: text, translatedText: text, normalizedRect: obs.boundingBox)
+            if let colors = pixels?.colors(for: obs.boundingBox) { box.background = colors.background; box.foreground = colors.foreground }
+            return box
         }
     }
 
@@ -475,20 +551,8 @@ struct OverlayContentView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            ForEach(boxes) { box in
-                let rect = convertVisionRect(box.normalizedRect, in: windowSize)
-                Text(box.translatedText)
-                    .font(.system(size: max(11, min(rect.height * 0.78, 26)), weight: .medium, design: .rounded))
-                    .foregroundColor(.white).minimumScaleFactor(0.45)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .frame(minWidth: max(rect.width + 10, 36), maxWidth: max(rect.width * 1.35, 120), minHeight: max(rect.height + 6, 20), alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(Color(red: 0.08, green: 0.08, blue: 0.12).opacity(settings.overlayOpacity))
-                            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.white.opacity(0.10), lineWidth: 0.5))
-                            .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
-                    )
-                    .position(x: rect.midX, y: rect.midY)
+            ForEach(layouts, id: \.box.id) { item in
+                translatedLabel(item)
             }
 
             statusBadge
@@ -496,6 +560,50 @@ struct OverlayContentView: View {
         }
         .frame(width: windowSize.width, height: windowSize.height, alignment: .topLeading)
         .environment(\.colorScheme, .dark)
+    }
+
+    // MARK: 譯文框排版
+    struct BoxLayout { let box: OCRTextBox; let frame: CGRect; let fontSize: CGFloat }
+
+    private var isInPlace: Bool { settings.overlayStyle == OverlayStyle.inPlace.rawValue }
+
+    /// 框剛好蓋住原文；譯文比原文長時往右延伸，但不蓋到同一行右邊的下一段文字
+    private var layouts: [BoxLayout] {
+        let rects = boxes.map { convertVisionRect($0.normalizedRect, in: windowSize) }
+        return boxes.enumerated().map { i, box in
+            let r = rects[i]
+            let fontSize = min(max(r.height * 0.82, 9), 40)
+            let padX: CGFloat = isInPlace ? 3 : 6, padY: CGFloat = isInPlace ? 1.5 : 3
+            let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+            let needed = (box.translatedText as NSString).size(withAttributes: [.font: font]).width + padX * 2
+            // 同一行（垂直重疊）且位於右側的下一個框
+            let nextX = rects.enumerated().filter { j, o in
+                j != i && o.minX > r.minX + r.width * 0.5 && o.maxY > r.minY + r.height * 0.3 && o.minY < r.maxY - r.height * 0.3
+            }.map(\.1.minX).min() ?? windowSize.width
+            let maxWidth = max(r.width + padX * 2, min(nextX - r.minX - 4 + padX, windowSize.width - r.minX))
+            let width = min(max(needed, r.width + padX * 2), maxWidth)
+            let frame = CGRect(x: r.minX - padX, y: r.minY - padY, width: width, height: r.height + padY * 2)
+            return BoxLayout(box: box, frame: frame, fontSize: fontSize)
+        }
+    }
+
+    @ViewBuilder
+    private func translatedLabel(_ item: BoxLayout) -> some View {
+        let box = item.box
+        let bg = isInPlace ? box.background.color : Color(red: 0.09, green: 0.09, blue: 0.13)
+        let fg = isInPlace ? box.foreground.color : Color.white
+        Text(box.translatedText)
+            .font(.system(size: item.fontSize, weight: .medium))
+            .foregroundColor(fg)
+            .lineLimit(1).minimumScaleFactor(0.45).allowsTightening(true)
+            .padding(.horizontal, isInPlace ? 3 : 6)
+            .frame(width: item.frame.width, height: item.frame.height, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: isInPlace ? 3 : 6, style: .continuous)
+                    .fill(bg.opacity(settings.overlayOpacity))
+                    .shadow(color: .black.opacity(isInPlace ? 0 : 0.3), radius: 3, y: 1) // 原地取代不加陰影，才不會在淺色背景上出現邊框
+            )
+            .position(x: item.frame.midX, y: item.frame.midY)
     }
 
     private var statusBadge: some View {
@@ -666,9 +774,14 @@ struct PreferencesView: View {
                 }
             }
             Section("顯示") {
+                SettingRow(symbol: "paintbrush.pointed", color: .pink, title: "譯文樣式") {
+                    Picker("", selection: $settings.overlayStyle) {
+                        ForEach(OverlayStyle.allCases) { style in Text(style.rawValue).tag(style.rawValue) }
+                    }.labelsHidden().pickerStyle(.segmented).fixedSize()
+                }
                 SettingRow(symbol: "circle.lefthalf.filled", color: .indigo, title: "譯文底色不透明度") {
                     HStack {
-                        Slider(value: $settings.overlayOpacity, in: 0.4...1.0, step: 0.05).frame(width: 200)
+                        Slider(value: $settings.overlayOpacity, in: 0.6...1.0, step: 0.05).frame(width: 200)
                         Text("\(Int(settings.overlayOpacity * 100))%").monospacedDigit().frame(width: 40, alignment: .trailing)
                     }
                 }
