@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="ScreenTranslator"
-VERSION="1.1.0"
+VERSION="1.1.1"
 BUNDLE_ID="com.sunchangxin.screentranslator"
 OUT="build"
 # 在暫存資料夾組裝：Documents 若由 iCloud 同步，會自動加上延伸屬性導致簽章失效

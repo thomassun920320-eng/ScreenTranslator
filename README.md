@@ -14,7 +14,7 @@
   - Google Gemini API
   - OpenAI API
   - Ollama 本機模型（離線、資料不外流）
-- API 金鑰存放在 macOS 鑰匙圈
+- 啟動時先在背景準備文字辨識模型，按下快捷鍵後約 1 秒內顯示譯文
 
 ## 安裝
 
