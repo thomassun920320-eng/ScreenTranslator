@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="ScreenTranslator"
-VERSION="1.1.1"
+VERSION="1.1.2"
 BUNDLE_ID="com.sunchangxin.screentranslator"
 OUT="build"
 # 在暫存資料夾組裝：Documents 若由 iCloud 同步，會自動加上延伸屬性導致簽章失效
@@ -56,9 +56,32 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-echo "▸ 簽署 (ad-hoc)"
+echo "▸ 簽署（固定的本機憑證）"
+# ad-hoc 簽章的身分是程式雜湊值，每次編譯都會變，macOS 就會把它當成新 App 而要求重新授權。
+# 改用一張固定的自簽憑證，存在獨立的鑰匙圈檔案（不動登入鑰匙圈），權限就能在更新後保留。
+SIGN_DIR="$HOME/Library/Application Support/ScreenTranslator-Signing"
+SIGN_KC="$SIGN_DIR/signing.keychain-db"
+SIGN_NAME="ScreenTranslator Local Signing"
+if [ ! -f "$SIGN_KC" ]; then
+  echo "  第一次編譯：建立簽章憑證於 $SIGN_DIR"
+  mkdir -p "$SIGN_DIR" && chmod 700 "$SIGN_DIR"
+  openssl rand -hex 24 > "$SIGN_DIR/keychain-password" && chmod 600 "$SIGN_DIR/keychain-password"
+  TMPC="$(mktemp -d)"
+  printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=%s\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' "$SIGN_NAME" > "$TMPC/cert.cnf"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMPC/key.pem" -out "$TMPC/cert.pem" -days 3650 -config "$TMPC/cert.cnf" 2>/dev/null
+  P12PASS="$(openssl rand -hex 12)"
+  openssl pkcs12 -export -legacy -inkey "$TMPC/key.pem" -in "$TMPC/cert.pem" -out "$TMPC/id.p12" -passout "pass:$P12PASS" 2>/dev/null \
+    || openssl pkcs12 -export -inkey "$TMPC/key.pem" -in "$TMPC/cert.pem" -out "$TMPC/id.p12" -passout "pass:$P12PASS"
+  security create-keychain -p "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC"
+  security set-keychain-settings "$SIGN_KC"
+  security unlock-keychain -p "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC"
+  security import "$TMPC/id.p12" -k "$SIGN_KC" -P "$P12PASS" -T /usr/bin/codesign >/dev/null
+  security set-key-partition-list -S apple-tool:,apple: -s -k "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC" >/dev/null 2>&1 || true
+  rm -rf "$TMPC"
+fi
+security unlock-keychain -p "$(cat "$SIGN_DIR/keychain-password")" "$SIGN_KC"
 xattr -cr "$APP"
-codesign --force --deep --sign - --identifier "$BUNDLE_ID" "$APP"
+codesign --force --deep --keychain "$SIGN_KC" --sign "$SIGN_NAME" --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP"
 
 echo "▸ 製作 DMG"

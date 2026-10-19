@@ -679,14 +679,7 @@ struct PreferencesView: View {
                     }
                 }
             }
-            Section {
-                Text("首次使用需在「系統設定 → 隱私權與安全性」中開啟「螢幕錄製」與「輔助使用」權限。")
-                    .font(.callout).foregroundStyle(.secondary)
-                HStack {
-                    Button("開啟螢幕錄製設定") { openPrivacyPane("Privacy_ScreenCapture") }
-                    Button("開啟輔助使用設定") { openPrivacyPane("Privacy_Accessibility") }
-                }
-            } header: { Text("權限") }
+            Section("權限") { PermissionSection() }
         }
         .formStyle(.grouped)
     }
@@ -785,9 +778,127 @@ struct PreferencesView: View {
             Spacer(minLength: 0)
         }
     }
+}
 
-    private func openPrivacyPane(_ anchor: String) {
+// MARK: - 5.5 權限管理
+// 每秒檢查一次權限狀態：輔助使用一允許就立即生效；螢幕錄製若仍需重開，提供一鍵重新啟動。
+final class PermissionManager: ObservableObject {
+    static let shared = PermissionManager()
+    @Published var accessibilityGranted = AXIsProcessTrusted()
+    @Published var screenGranted = CGPreflightScreenCaptureAccess()
+    @Published var screenNeedsRelaunch = false // 已在系統設定開啟，但此程序仍無法擷取
+    var onAccessibilityGranted: (() -> Void)?
+    private var timer: Timer?
+
+    var allGranted: Bool { accessibilityGranted && screenGranted }
+
+    func startMonitoring() {
+        guard timer == nil else { return }
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func refresh() {
+        let ax = AXIsProcessTrusted()
+        if ax && !accessibilityGranted { appLog("已取得輔助使用權限"); onAccessibilityGranted?() }
+        accessibilityGranted = ax
+        if !screenGranted {
+            // CGPreflight 在授權後常要重開才會變 true，改用 ScreenCaptureKit 實際試一次
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+                DispatchQueue.main.async {
+                    if content != nil { self.screenGranted = true; self.screenNeedsRelaunch = false; appLog("已取得螢幕錄製權限") }
+                    else if self.screenRequested && CGPreflightScreenCaptureAccess() { self.screenNeedsRelaunch = true }
+                }
+            }
+        }
+        if allGranted { timer?.invalidate(); timer = nil }
+    }
+
+    private var screenRequested: Bool {
+        get { UserDefaults.standard.bool(forKey: "screenCaptureRequested_v5") }
+        set { UserDefaults.standard.set(newValue, forKey: "screenCaptureRequested_v5") }
+    }
+
+    func requestScreen() {
+        screenRequested = true
+        // 系統對同一個 App 只會跳一次詢問視窗，之後直接帶到系統設定
+        if !CGRequestScreenCaptureAccess() { openPane("Privacy_ScreenCapture") }
+        startMonitoring()
+    }
+
+    func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(options) { openPane("Privacy_Accessibility") }
+        startMonitoring()
+    }
+
+    func openPane(_ anchor: String) {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") { NSWorkspace.shared.open(url) }
+    }
+
+    func relaunch() {
+        let path = Bundle.main.bundlePath.replacingOccurrences(of: "'", with: "'\\''")
+        let task = Process(); task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "sleep 0.6; /usr/bin/open '\(path)'"]
+        try? task.run()
+        NSApp.terminate(nil)
+    }
+}
+
+struct PermissionRow: View {
+    let symbol: String; let color: Color; let title: String; let detail: String
+    let granted: Bool; let actionTitle: String; let action: () -> Void
+    var body: some View {
+        HStack(spacing: 12) {
+            IconBadge(symbol: symbol, color: color)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail).font(.system(size: 11.5)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if granted {
+                Label("已允許", systemImage: "checkmark.circle.fill").labelStyle(.titleAndIcon)
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.green)
+            } else {
+                Button(actionTitle, action: action).buttonStyle(.borderedProminent)
+            }
+        }
+    }
+}
+
+struct PermissionSection: View {
+    @ObservedObject var permissions = PermissionManager.shared
+    var body: some View {
+        PermissionRow(symbol: "rectangle.dashed.badge.record", color: .red, title: "螢幕錄製",
+                      detail: permissions.screenNeedsRelaunch ? "已在系統設定開啟，請重新啟動 App 讓權限生效" : "用來擷取目前視窗畫面",
+                      granted: permissions.screenGranted,
+                      actionTitle: permissions.screenNeedsRelaunch ? "重新啟動 App" : "允許") {
+            permissions.screenNeedsRelaunch ? permissions.relaunch() : permissions.requestScreen()
+        }
+        PermissionRow(symbol: "accessibility", color: .blue, title: "輔助使用",
+                      detail: "用來偵測全域快捷鍵（Fn + C），允許後立即生效",
+                      granted: permissions.accessibilityGranted, actionTitle: "允許") { permissions.requestAccessibility() }
+    }
+}
+
+struct PermissionOnboardingView: View {
+    @ObservedObject var permissions = PermissionManager.shared
+    var onDone: () -> Void
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 72, height: 72)
+            VStack(spacing: 6) {
+                Text("開始使用 ScreenTranslator").font(.system(size: 20, weight: .bold, design: .rounded))
+                Text("需要以下兩項權限。每項只要允許一次，之後更新 App 也會保留。")
+                    .font(.system(size: 12.5)).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            }
+            Form { Section { PermissionSection() } }.formStyle(.grouped).scrollDisabled(true).frame(height: 170)
+            Button(permissions.allGranted ? "完成，開始使用" : "稍後再說") { onDone() }
+                .keyboardShortcut(.defaultAction).controlSize(.large)
+                .buttonStyle(.borderedProminent).tint(permissions.allGranted ? .accentColor : .gray)
+        }
+        .padding(.horizontal, 24).padding(.top, 10).padding(.bottom, 22)
+        .frame(width: 500)
     }
 }
 
@@ -807,7 +918,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalHotkeyMonitors()
         OCREngine.shared.warmUp()
         SettingsManager.shared.migrateKeychainKeysIfNeeded()
-        if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
+        let permissions = PermissionManager.shared
+        permissions.onAccessibilityGranted = { [weak self] in self?.installEventTap() }
+        permissions.startMonitoring()
+        appLog("啟動：輔助使用=\(permissions.accessibilityGranted) 螢幕錄製=\(permissions.screenGranted)")
+        // 不再每次啟動都跳系統詢問；缺權限時才顯示引導視窗（等 ScreenCaptureKit 檢查完再判斷）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            if !permissions.allGranted { self?.showPermissionWindow() }
+        }
+    }
+
+    var permissionWindow: NSWindow?
+    @objc func showPermissionWindow() {
+        if permissionWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 420), styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            window.titlebarAppearsTransparent = true; window.titleVisibility = .hidden; window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: PermissionOnboardingView { [weak self] in self?.permissionWindow?.close() })
+            window.center(); permissionWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true); permissionWindow?.makeKeyAndOrderFront(nil)
     }
 
     // MARK: 關鍵修正：為無邊框/常駐程式掛載系統 Edit 選單，讓 ⌘+C / ⌘+V / ⌘+A 生效
@@ -862,6 +991,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggleItem)
         menu.addItem(.separator())
         menu.addItem(menuItem("偏好設定…", symbol: "gearshape", action: #selector(openPreferences), key: ","))
+        menu.addItem(menuItem("權限設定…", symbol: "lock.shield", action: #selector(showPermissionWindow)))
         menu.addItem(.separator())
         menu.addItem(menuItem("結束翻譯小工具", symbol: "power", action: #selector(quitApp), key: "q"))
         statusItem.menu = menu
@@ -873,8 +1003,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupGlobalHotkeyMonitors() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(options)
+        installEventTap()
+        setupCarbonHotKey()
+        // 只在快捷鍵設定真的改變時才重新註冊（原本每次任何設定變動都會重新註冊）
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.registeredPreset != SettingsManager.shared.hotkeyPreset else { return }
+            self.setupCarbonHotKey(); self.updateToggleMenuTitle()
+        }
+        let fallbackHandler: (NSEvent) -> Void = { [weak self] event in
+            guard let self = self else { return }; if let tap = self.eventTap, CGEvent.tapIsEnabled(tap: tap) { return }; self.handleFallbackNSEvent(event)
+        }
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged], handler: fallbackHandler)
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in fallbackHandler(event); return event }
+    }
+
+    // 需要輔助使用權限；沒權限時先跳過，取得權限後由 PermissionManager 再呼叫一次
+    func installEventTap() {
+        guard eventTap == nil, AXIsProcessTrusted() else { return }
         let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.flagsChanged.rawValue)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         if let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap, eventsOfInterest: CGEventMask(eventMask), callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
@@ -889,18 +1034,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }, userInfo: refcon) {
             self.eventTap = tap; let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0); self.runLoopSource = source
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes); CGEvent.tapEnable(tap: tap, enable: true)
+            appLog("全域快捷鍵監聽已啟用")
         }
-        setupCarbonHotKey()
-        // 只在快捷鍵設定真的改變時才重新註冊（原本每次任何設定變動都會重新註冊）
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.registeredPreset != SettingsManager.shared.hotkeyPreset else { return }
-            self.setupCarbonHotKey(); self.updateToggleMenuTitle()
-        }
-        let fallbackHandler: (NSEvent) -> Void = { [weak self] event in
-            guard let self = self else { return }; if let tap = self.eventTap, CGEvent.tapIsEnabled(tap: tap) { return }; self.handleFallbackNSEvent(event)
-        }
-        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged], handler: fallbackHandler)
-        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in fallbackHandler(event); return event }
     }
 
     private func handleHardwareCGEvent(type: CGEventType, event: CGEvent) -> Bool {

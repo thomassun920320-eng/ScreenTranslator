@@ -21,7 +21,7 @@
 1. 到 [Releases](../../releases) 下載 `ScreenTranslator-x.y.z.dmg`
 2. 開啟 DMG，把 **ScreenTranslator** 拖到「應用程式」資料夾
 3. 第一次開啟時，在 App 上按右鍵 →「打開」（App 只有本機簽署，沒有經過 Apple 公證）
-4. 到「系統設定 → 隱私權與安全性」開啟 **螢幕錄製** 與 **輔助使用** 權限
+4. 第一次啟動會出現權限引導視窗，依序允許 **螢幕錄製** 與 **輔助使用**。輔助使用允許後立即生效；螢幕錄製若提示需要重開，按「重新啟動 App」即可。之後更新 App 不必重新授權（也可從選單列 →「權限設定…」再次開啟）
 
 需要 macOS 14 以上，同時支援 Apple Silicon 與 Intel。
 
@@ -40,4 +40,4 @@
 | `Sources/main.swift` | App 原始碼 |
 | `scripts/make_icon.swift` | 產生 App 圖示 |
 | `assets/icon_1024.png` | 圖示原圖 |
-| `build.sh` | 編譯、簽署並打包成 DMG |
+| `build.sh` | 編譯、簽署並打包成 DMG（第一次執行會在 `~/Library/Application Support/ScreenTranslator-Signing` 建立固定的本機簽章憑證，讓權限在更新後保留） |
