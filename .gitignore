@@ -1,0 +1,7 @@
+build/
+.DS_Store
+*.dmg
+# 舊版檔案（已由 Sources/main.swift 與 build.sh 取代）
+/macos.swift
+/ScreenTranslator
+/ScreenTranslator.app/
