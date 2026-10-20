@@ -477,7 +477,7 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
     func recognize(_ image: CGImage, minConfidence: Float, timeout: TimeInterval) async -> Result<[OCRTextBox], OCRError> {
         let acquired = lock.withLock { () -> Bool in if busy { return false }; busy = true; return true }
         guard acquired else { return .failure(.busy) }
-        let plain = Self.plainCopy(of: image) ?? image
+        let plain = image
         return await withCheckedContinuation { continuation in
             let once = NSLock(); var resumed = false
             let finish: (Result<[OCRTextBox], OCRError>) -> Void = { result in
@@ -493,14 +493,39 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         }
     }
 
-    private static func recognize(_ cgImage: CGImage, minConfidence: Float) -> [OCRTextBox] {
+    private static func describe(_ image: CGImage) -> String {
+        "\(image.width)x\(image.height) bpc=\(image.bitsPerComponent) bpp=\(image.bitsPerPixel) info=\(image.bitmapInfo.rawValue) cs=\((image.colorSpace?.name as String?) ?? "nil")"
+    }
+
+    private static func perform(_ image: CGImage) -> Result<[VNRecognizedTextObservation], Error> {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate; request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hant", "zh-Hans", "ko-KR"]
-        do { try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request]) }
-        catch { appLog("OCR 失敗：\(error.localizedDescription)"); return [] }
+        do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]); return .success(request.results ?? []) }
+        catch { return .failure(error) }
+    }
+
+    private static func recognize(_ input: CGImage, minConfidence: Float) -> [OCRTextBox] {
+        // 有些 App（例如 FreeShow 等 Electron 程式）擷取到的影像格式 Vision 讀不了，依序換格式重試
+        var cgImage = input
+        var observations: [VNRecognizedTextObservation] = []
+        var attempts: [(String, () -> CGImage?)] = [("原圖", { input })]
+        attempts.append(("sRGB 不透明", { plainCopy(of: input, scale: 1) }))
+        attempts.append(("縮小一半", { plainCopy(of: input, scale: 0.5) }))
+        for (index, (name, make)) in attempts.enumerated() {
+            guard let candidate = make() else { appLog("OCR 轉換失敗（\(name)）"); continue }
+            switch perform(candidate) {
+            case .success(let result):
+                if index > 0 { appLog("OCR 改用「\(name)」格式後成功") }
+                cgImage = candidate; observations = result
+            case .failure(let error):
+                appLog("OCR 失敗（\(name)，\(describe(candidate))）：\(error.localizedDescription)")
+                continue
+            }
+            break
+        }
         let pixels = PixelBuffer(cgImage)
-        return (request.results ?? []).compactMap { obs in
+        return observations.compactMap { obs in
             guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { return nil }
             let text = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard text.count > 1, text.rangeOfCharacter(from: .letters) != nil else { return nil }
@@ -510,11 +535,15 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         }
     }
 
-    // 螢幕擷取的影像由 IOSurface 支撐，先複製成一般點陣圖再交給 Vision
-    private static func plainCopy(of image: CGImage) -> CGImage? {
-        guard let ctx = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    // 複製成 8 位元 sRGB、不透明的一般點陣圖（螢幕擷取的影像由 IOSurface 支撐，格式可能是 HDR 或廣色域）
+    private static func plainCopy(of image: CGImage, scale: CGFloat) -> CGImage? {
+        let w = max(1, Int(CGFloat(image.width) * scale)), h = max(1, Int(CGFloat(image.height) * scale))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
         return ctx.makeImage()
     }
 
@@ -1275,6 +1304,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // 以實際像素擷取 (Retina 為 2 倍)，文字辨識準確度大幅提升
                 let scale = await MainActor.run { NSScreen.screens.first(where: { $0.frame.intersects(cocoaFrame) })?.backingScaleFactor ?? 2.0 }
                 config.width = Int(cgBounds.width * scale); config.height = Int(cgBounds.height * scale); config.showsCursor = false
+                // 固定擷取成標準 8 位元 sRGB，避免 HDR／廣色域的視窗讓 Vision 讀不了
+                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.colorSpaceName = CGColorSpace.sRGB
+                if #available(macOS 15.0, *) { config.captureDynamicRange = .SDR }
                 let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
                 let loadingText = OCREngine.shared.isWarm ? "正在辨識與翻譯…" : "首次使用，正在準備文字辨識模型（約 30 秒）…"
                 await MainActor.run { guard generation == self.captureGeneration else { return }; self.showOverlayWindow(frame: cocoaFrame, boxes: [], engineName: "", isLoading: true, loadingText: loadingText) }
