@@ -497,40 +497,70 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         "\(image.width)x\(image.height) bpc=\(image.bitsPerComponent) bpp=\(image.bitsPerPixel) info=\(image.bitmapInfo.rawValue) cs=\((image.colorSpace?.name as String?) ?? "nil")"
     }
 
-    private static func perform(_ image: CGImage) -> Result<[VNRecognizedTextObservation], Error> {
+    // 一段辨識結果（可在子程序與主程序之間以 JSON 傳遞）
+    struct Line: Codable { let text: String; let confidence: Float; let x, y, w, h: Double }
+
+    static func performInProcess(_ image: CGImage) -> Result<[Line], Error> {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate; request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hant", "zh-Hans", "ko-KR"]
-        do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]); return .success(request.results ?? []) }
+        do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]) }
         catch { return .failure(error) }
+        return .success((request.results ?? []).compactMap { obs in
+            guard let top = obs.topCandidates(1).first else { return nil }
+            let b = obs.boundingBox
+            return Line(text: top.string, confidence: top.confidence, x: b.minX, y: b.minY, w: b.width, h: b.height)
+        })
+    }
+
+    // Vision 在長時間執行（例如睡眠喚醒）後，本程序內有時會失敗（CRImageReaderError），但新開的程序可以正常辨識。
+    // 因此每次先在本程序辨識，失敗時改用子程序，不必重開 App。環境變數供測試用。
+    private static let forceHelper = ProcessInfo.processInfo.environment["ST_FORCE_OCR_HELPER"] == "1"
+
+    private static func performInHelper(_ image: CGImage) -> Result<[Line], Error> {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("st-ocr-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return .failure(TranslationError("無法建立暫存影像")) }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest), let exe = Bundle.main.executableURL else { return .failure(TranslationError("無法寫入暫存影像")) }
+        let task = Process(); task.executableURL = exe; task.arguments = ["--ocr-helper", url.path]
+        let out = Pipe(); task.standardOutput = out; task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return .failure(error) }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0, let lines = try? JSONDecoder().decode([Line].self, from: data) else {
+            return .failure(TranslationError("子程序辨識失敗（代碼 \(task.terminationStatus)）"))
+        }
+        return .success(lines)
     }
 
     private static func recognize(_ input: CGImage, minConfidence: Float) -> [OCRTextBox] {
-        // 有些 App（例如 FreeShow 等 Electron 程式）擷取到的影像格式 Vision 讀不了，依序換格式重試
-        var cgImage = input
-        var observations: [VNRecognizedTextObservation] = []
-        var attempts: [(String, () -> CGImage?)] = [("原圖", { input })]
-        attempts.append(("sRGB 不透明", { plainCopy(of: input, scale: 1) }))
-        attempts.append(("縮小一半", { plainCopy(of: input, scale: 0.5) }))
-        for (index, (name, make)) in attempts.enumerated() {
-            guard let candidate = make() else { appLog("OCR 轉換失敗（\(name)）"); continue }
-            switch perform(candidate) {
-            case .success(let result):
-                if index > 0 { appLog("OCR 改用「\(name)」格式後成功") }
-                cgImage = candidate; observations = result
+        let image = plainCopy(of: input, scale: 1) ?? input // 統一成 8 位元 sRGB，顏色取樣與子程序都用這張
+        var lines: [Line] = []
+        var useHelper = forceHelper
+        if !useHelper {
+            switch performInProcess(image) {
+            case .success(let result): lines = result
             case .failure(let error):
-                appLog("OCR 失敗（\(name)，\(describe(candidate))）：\(error.localizedDescription)")
-                continue
+                appLog("OCR 失敗（\(describe(image))）：\(error.localizedDescription)，改用子程序辨識")
+                useHelper = true
             }
-            break
         }
-        let pixels = PixelBuffer(cgImage)
-        return observations.compactMap { obs in
-            guard let top = obs.topCandidates(1).first, top.confidence >= minConfidence else { return nil }
-            let text = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if useHelper {
+            let start = Date()
+            switch performInHelper(image) {
+            case .success(let result): lines = result; appLog("子程序辨識完成，耗時 \(String(format: "%.1f", Date().timeIntervalSince(start))) 秒")
+            case .failure(let error): appLog("子程序辨識失敗：\(error.localizedDescription)")
+            }
+        }
+        let pixels = PixelBuffer(image)
+        return lines.compactMap { line in
+            guard line.confidence >= minConfidence else { return nil }
+            let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard text.count > 1, text.rangeOfCharacter(from: .letters) != nil else { return nil }
-            var box = OCRTextBox(originalText: text, translatedText: text, normalizedRect: obs.boundingBox)
-            if let colors = pixels?.colors(for: obs.boundingBox) { box.background = colors.background; box.foreground = colors.foreground }
+            let rect = CGRect(x: line.x, y: line.y, width: line.w, height: line.h)
+            var box = OCRTextBox(originalText: text, translatedText: text, normalizedRect: rect)
+            if let colors = pixels?.colors(for: rect) { box.background = colors.background; box.foreground = colors.foreground }
             return box
         }
     }
@@ -1353,6 +1383,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - 7. 應用程式入口
+// 子程序模式：ScreenTranslator --ocr-helper <影像路徑>，把辨識結果以 JSON 輸出到 stdout
+if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--ocr-helper" {
+    guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[2]) as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          case .success(let lines) = OCREngine.performInProcess(image),
+          let json = try? JSONEncoder().encode(lines) else { exit(1) }
+    FileHandle.standardOutput.write(json)
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
