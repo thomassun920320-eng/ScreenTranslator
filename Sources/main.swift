@@ -4,7 +4,6 @@ import Vision
 import CoreGraphics
 import Carbon
 import ScreenCaptureKit
-import Security
 import ServiceManagement
 
 // MARK: - 1. 設定與翻譯引擎模型
@@ -75,28 +74,6 @@ enum HotkeyPreset: String, CaseIterable, Identifiable {
     var id: String { self.rawValue }
 }
 
-// MARK: 1.1.0 曾把金鑰存進鑰匙圈，但沒有開發者簽章的 App 每次更新後簽章都會改變，
-// 讀寫鑰匙圈每次要等 10 秒以上，甚至跳出授權視窗。因此改回存在設定檔，這裡只用來把舊資料搬回來。
-enum Keychain {
-    private static let service = "com.sunchangxin.screentranslator"
-
-    static func read(_ account: String) -> String {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                    kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return "" }
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    static func write(_ value: String, for account: String) {
-        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
-        SecItemDelete(base as CFDictionary)
-        guard !value.isEmpty else { return }
-        var add = base; add[kSecValueData as String] = Data(value.utf8)
-        SecItemAdd(add as CFDictionary, nil)
-    }
-}
-
 class SettingsManager: ObservableObject {
     static let shared = SettingsManager()
 
@@ -122,29 +99,10 @@ class SettingsManager: ObservableObject {
     @Published var testStatus: String = "貼上金鑰後，點擊「測試連線」確認是否可用"
     @Published var isTesting = false
 
-    // 在背景把 1.1.0 存進鑰匙圈的金鑰搬回設定檔，只執行一次
-    func migrateKeychainKeysIfNeeded() {
-        let flag = "keychainMigratedBack_v5"
-        guard !UserDefaults.standard.bool(forKey: flag) else { return }
-        DispatchQueue.global(qos: .utility).async {
-            let gemini = Keychain.read("geminiApiKey"), openAI = Keychain.read("openAIApiKey")
-            DispatchQueue.main.async {
-                if self.geminiApiKey.isEmpty && !gemini.isEmpty { self.geminiApiKey = gemini }
-                if self.openAIApiKey.isEmpty && !openAI.isEmpty { self.openAIApiKey = openAI }
-                UserDefaults.standard.set(true, forKey: flag)
-                appLog("已將鑰匙圈中的金鑰搬回設定檔")
-                DispatchQueue.global(qos: .utility).async { Keychain.write("", for: "geminiApiKey"); Keychain.write("", for: "openAIApiKey") }
-            }
-        }
-    }
-
+    /// 語言選項的格式是「名稱 (代碼)」，取出括號內的代碼
     var targetLangCode: String {
-        if targetLanguage.contains("zh-TW") { return "zh-TW" }
-        if targetLanguage.contains("zh-CN") { return "zh-CN" }
-        if targetLanguage.contains("en") { return "en" }
-        if targetLanguage.contains("ja") { return "ja" }
-        if targetLanguage.contains("ko") { return "ko" }
-        return "zh-TW"
+        guard let open = targetLanguage.lastIndex(of: "("), let close = targetLanguage.lastIndex(of: ")"), open < close else { return "zh-TW" }
+        return String(targetLanguage[targetLanguage.index(after: open)..<close])
     }
 }
 
@@ -163,22 +121,25 @@ struct OCRTextBox: Identifiable, Sendable {
     let normalizedRect: CGRect
     var background: RGB = .black // 原文周圍的背景色
     var foreground: RGB = .white // 原文的文字顏色
+    var isTranslated: Bool { translatedText.trimmingCharacters(in: .whitespaces) != originalText }
 }
 
-// 螢幕截圖的 RGBA 像素，用來取樣原文的背景色與文字色，讓譯文能「原地取代」
+// 把螢幕截圖轉成 8 位元 sRGB、不透明的點陣圖（擷取的影像由 IOSurface 支撐，格式可能是 HDR 或廣色域）。
+// `image` 交給 Vision 辨識，`data` 用來取樣原文的背景色與文字色，讓譯文能「原地取代」。
 struct PixelBuffer {
     let data: [UInt8]; let width: Int; let height: Int; let bytesPerRow: Int
+    let image: CGImage
 
-    init?(_ image: CGImage) {
-        let w = image.width, h = image.height, rowBytes = w * 4
-        var bytes = [UInt8](repeating: 0, count: rowBytes * h)
-        let ok = bytes.withUnsafeMutableBytes { buf -> Bool in
-            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: rowBytes,
-                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h)); return true
-        }
-        guard ok else { return nil }
-        data = bytes; width = w; height = h; bytesPerRow = rowBytes
+    init?(_ source: CGImage) {
+        let w = source.width, h = source.height
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.draw(source, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let base = ctx.data, let copy = ctx.makeImage() else { return nil }
+        data = Array(UnsafeBufferPointer(start: base.assumingMemoryBound(to: UInt8.self), count: ctx.bytesPerRow * h))
+        width = w; height = h; bytesPerRow = ctx.bytesPerRow; image = copy
     }
 
     // 以左上為原點的像素座標
@@ -222,40 +183,51 @@ struct PixelBuffer {
 }
 
 // MARK: - 3. 翻譯服務 (含 503 自動重試與智慧降級)
+struct TranslationOutcome {
+    let texts: [String]
+    let engineName: String
+    var isFallback = false // AI 引擎沒用上，改由 Google 免費翻譯
+}
+
 class TranslationService {
     static let shared = TranslationService()
 
-    func translateBatch(texts: [String]) async -> (results: [String], usedEngineName: String) {
-        guard !texts.isEmpty else { return ([], "無") }
+    // 智慧優先模式下，AI 引擎回 429（額度用完）後暫停一段時間，不必每次都先等它失敗
+    private let cooldownLock = NSLock()
+    private var aiCooldownUntil = Date.distantPast
+
+    func translateBatch(texts: [String]) async -> TranslationOutcome {
+        guard !texts.isEmpty else { return TranslationOutcome(texts: [], engineName: "無") }
         let settings = SettingsManager.shared
         let engine = TranslationEngine(rawValue: settings.selectedEngine) ?? .smartFallback
+        func google(_ reason: String? = nil) async -> TranslationOutcome {
+            let result = await translateWithGoogleFree(texts: texts, targetLang: settings.targetLangCode)
+            return TranslationOutcome(texts: result, engineName: reason.map { "Google 免費翻譯 (\($0))" } ?? "Google 免費翻譯", isFallback: reason != nil)
+        }
 
-        let aiEngine: TranslationEngine
-        switch engine {
-        case .googleFree:
-            return (await translateWithGoogleFree(texts: texts, targetLang: settings.targetLangCode), "Google 免費翻譯")
-        case .smartFallback:
-            aiEngine = TranslationEngine(rawValue: settings.primaryAIEngine) ?? .gemini
-            // 智慧模式下未填金鑰就直接走 Google，不浪費一次失敗請求
-            if (aiEngine == .gemini && settings.geminiApiKey.trimmingCharacters(in: .whitespaces).isEmpty) ||
-               (aiEngine == .openai && settings.openAIApiKey.trimmingCharacters(in: .whitespaces).isEmpty) {
-                return (await translateWithGoogleFree(texts: texts, targetLang: settings.targetLangCode), "Google 免費翻譯 (未設定 \(aiEngine.shortName) 金鑰)")
-            }
-        default:
-            aiEngine = engine
+        if engine == .googleFree { return await google() }
+        let isSmart = engine == .smartFallback
+        let aiEngine = isSmart ? (TranslationEngine(rawValue: settings.primaryAIEngine) ?? .gemini) : engine
+        if isSmart {
+            // 未填金鑰或額度剛用完就直接走 Google，不浪費一次失敗請求
+            let key = aiEngine == .gemini ? settings.geminiApiKey : aiEngine == .openai ? settings.openAIApiKey : "-"
+            if key.trimmingCharacters(in: .whitespaces).isEmpty { return await google("未設定 \(aiEngine.shortName) 金鑰") }
+            if cooldownLock.withLock({ Date() < aiCooldownUntil }) { return await google("\(aiEngine.shortName) 額度已用完，稍後自動重試") }
         }
 
         do {
-            let res: [String]
+            let result: [String]
             switch aiEngine {
-            case .openai: res = try await translateWithOpenAI(texts: texts, targetLang: settings.targetLanguage)
-            case .ollama: res = try await translateWithOllama(texts: texts, targetLang: settings.targetLanguage)
-            default: res = try await translateWithGemini(texts: texts, targetLang: settings.targetLanguage)
+            case .openai: result = try await translateWithOpenAI(texts: texts, targetLang: settings.targetLanguage)
+            case .ollama: result = try await translateWithOllama(texts: texts, targetLang: settings.targetLanguage)
+            default: result = try await translateWithGemini(texts: texts, targetLang: settings.targetLanguage)
             }
-            return (res, aiEngine.shortName)
+            return TranslationOutcome(texts: result, engineName: aiEngine.shortName)
         } catch {
-            let fallback = await translateWithGoogleFree(texts: texts, targetLang: settings.targetLangCode)
-            return (fallback, "Google 免費翻譯 (\(aiEngine.shortName) 失敗: \(error.localizedDescription))")
+            if isSmart, (error as? TranslationError)?.status == 429 {
+                cooldownLock.withLock { aiCooldownUntil = Date().addingTimeInterval(600) }
+            }
+            return await google("\(aiEngine.shortName) 失敗: \(error.localizedDescription)")
         }
     }
 
@@ -301,7 +273,7 @@ class TranslationService {
         var request = URLRequest(url: url); request.timeoutInterval = 10
         let started = Date()
         guard let (data, response) = try? await URLSession.shared.data(for: request) else {
-            appLog("Google 請求失敗（\(String(format: "%.1f", Date().timeIntervalSince(started))) 秒）"); return nil
+            appLog("Google 請求失敗（\(elapsed(started)) 秒）"); return nil
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else { appLog("Google 回應 HTTP \(status)"); return nil }
@@ -334,12 +306,39 @@ class TranslationService {
         return arr
     }
 
-    private func apiErrorMessage(_ data: Data, status: Int) -> String {
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let err = json["error"] as? [String: Any], let msg = err["message"] as? String { return "HTTP \(status): \(msg)" }
-            if let msg = json["error"] as? String { return "HTTP \(status): \(msg)" }
+    private func apiError(_ data: Data, status: Int) -> TranslationError {
+        let json = try? JSONSerialization.jsonObject(with: data)
+        let detail = (dig(json, "error", "message") as? String) ?? (dig(json, "error") as? String)
+        return TranslationError(detail.map { "HTTP \(status): \($0)" } ?? "HTTP \(status)", status: status)
+    }
+
+    /// 依序以字典鍵或陣列索引往下取值，例如 dig(json, "choices", 0, "message", "content")
+    private func dig(_ json: Any?, _ path: Any...) -> Any? {
+        path.reduce(json) { node, key in
+            if let key = key as? String { return (node as? [String: Any])?[key] }
+            if let index = key as? Int, let array = node as? [Any], array.indices.contains(index) { return array[index] }
+            return nil
         }
-        return "HTTP \(status)"
+    }
+
+    private func postJSON(_ url: URL, headers: [String: String] = [:], body: [String: Any], timeout: TimeInterval) async throws -> (status: Int, data: Data) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"; request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        return ((response as? HTTPURLResponse)?.statusCode ?? 0, data)
+    }
+
+    /// 送出請求並從回應的 JSON 依 path 取出模型輸出的文字，再解析成譯文陣列
+    private func requestTranslations(_ name: String, url: URL, headers: [String: String] = [:], body: [String: Any], timeout: TimeInterval,
+                                     path: [Any], expectedCount: Int) async throws -> [String] {
+        let (status, data) = try await postJSON(url, headers: headers, body: body, timeout: timeout)
+        guard status == 200 else { throw apiError(data, status: status) }
+        let json = try? JSONSerialization.jsonObject(with: data)
+        guard let text = path.reduce(json, { dig($0, $1) }) as? String else { throw TranslationError("\(name) 回傳格式異常") }
+        return try parseTranslations(text, expectedCount: expectedCount)
     }
 
     // MARK: Gemini API (若遇 503 伺服器繁忙，自動切換至輕量模型重試)
@@ -350,39 +349,22 @@ class TranslationService {
 
         var seen = Set<String>()
         let candidateModels = [userModel, "gemini-flash-lite-latest", "gemini-flash-latest"].filter { !$0.isEmpty && seen.insert($0).inserted }
-
         let body: [String: Any] = [
             "contents": [["parts": [["text": try translationPrompt(texts, targetLang: targetLang)]]]],
             "generationConfig": ["responseMimeType": "application/json"]
         ]
-        let bodyData = try JSONSerialization.data(withJSONObject: body)
-        var lastError = "連線失敗"
-
+        var lastError = TranslationError("連線失敗")
         for model in candidateModels {
             guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent") else { continue }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.addValue(apiKey, forHTTPHeaderField: "x-goog-api-key") // 金鑰放在標頭，不出現在網址中
-            request.timeoutInterval = 15
-            request.httpBody = bodyData
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResp = response as? HTTPURLResponse else { continue }
-
-            if httpResp.statusCode == 200 {
-                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let candidates = json["candidates"] as? [[String: Any]],
-                      let content = candidates.first?["content"] as? [String: Any],
-                      let parts = content["parts"] as? [[String: Any]],
-                      let textOut = parts.first?["text"] as? String else { throw TranslationError("Gemini 回傳格式異常") }
-                return try parseTranslations(textOut, expectedCount: texts.count)
+            do {
+                // 金鑰放在標頭，不出現在網址中
+                return try await requestTranslations("Gemini", url: url, headers: ["x-goog-api-key": apiKey], body: body, timeout: 15,
+                                                     path: ["candidates", 0, "content", "parts", 0, "text"], expectedCount: texts.count)
+            } catch let error as TranslationError where error.status == 503 || error.status == 404 {
+                lastError = error // 503 塞車或 404 模型名稱不對，自動嘗試下一個備用模型
             }
-            lastError = apiErrorMessage(data, status: httpResp.statusCode)
-            // 若為 503 塞車或 404 模型名稱不對，自動嘗試下一個備用模型
-            if httpResp.statusCode != 503 && httpResp.statusCode != 404 { break }
         }
-        throw TranslationError(lastError)
+        throw lastError
     }
 
     private func translateWithOpenAI(texts: [String], targetLang: String) async throws -> [String] {
@@ -390,67 +372,57 @@ class TranslationService {
         let apiKey = settings.openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !apiKey.isEmpty else { throw TranslationError("未設定 OpenAI API Key") }
         let model = settings.openAIModel.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var request = URLRequest(url: URL(string: "https://api.openai.com/v1/chat/completions")!)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 20
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        let body: [String: Any] = [
             "model": model.isEmpty ? "gpt-4o-mini" : model,
             "response_format": ["type": "json_object"],
             "messages": [["role": "user", "content": try translationPrompt(texts, targetLang: targetLang)]]
-        ] as [String: Any])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else { throw TranslationError(apiErrorMessage(data, status: status)) }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else { throw TranslationError("OpenAI 回傳格式異常") }
-        return try parseTranslations(content, expectedCount: texts.count)
+        ]
+        return try await requestTranslations("OpenAI", url: URL(string: "https://api.openai.com/v1/chat/completions")!,
+                                             headers: ["Authorization": "Bearer \(apiKey)"], body: body, timeout: 20,
+                                             path: ["choices", 0, "message", "content"], expectedCount: texts.count)
     }
 
     private func translateWithOllama(texts: [String], targetLang: String) async throws -> [String] {
         let settings = SettingsManager.shared
         let endpoint = settings.ollamaEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(endpoint)/api/chat") else { throw TranslationError("Ollama 位址格式錯誤") }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        let body: [String: Any] = [
             "model": settings.ollamaModel,
             "stream": false,
             "format": "json",
             "messages": [["role": "user", "content": try translationPrompt(texts, targetLang: targetLang)]]
-        ] as [String: Any])
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard status == 200 else { throw TranslationError(apiErrorMessage(data, status: status)) }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let message = json["message"] as? [String: Any],
-              let content = message["content"] as? String else { throw TranslationError("Ollama 回傳格式異常") }
-        return try parseTranslations(content, expectedCount: texts.count)
+        ]
+        return try await requestTranslations("Ollama", url: url, body: body, timeout: 60, path: ["message", "content"], expectedCount: texts.count)
     }
 }
 
 struct TranslationError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    var status: Int? = nil // HTTP 狀態碼（若錯誤來自伺服器回應）
+    init(_ message: String, status: Int? = nil) { self.message = message; self.status = status }
     var errorDescription: String? { message }
 }
 
 // MARK: - 3.5 文字辨識 (Vision)
+private let logQueue = DispatchQueue(label: "com.sunchangxin.screentranslator.log")
+private let logTimestamp = ISO8601DateFormatter()
+
+/// 寫入 ~/Library/Logs/ScreenTranslator.log；超過 1 MB 時把舊內容移到 .old.log
 func appLog(_ message: String) {
-    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ScreenTranslator.log")
-    let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-    if let handle = try? FileHandle(forWritingTo: url) { handle.seekToEndOfFile(); handle.write(Data(line.utf8)); try? handle.close() }
-    else { try? Data(line.utf8).write(to: url) }
+    logQueue.sync {
+        let logs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
+        let url = logs.appendingPathComponent("ScreenTranslator.log")
+        if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int, size > 1_000_000 {
+            let old = logs.appendingPathComponent("ScreenTranslator.old.log")
+            try? FileManager.default.removeItem(at: old); try? FileManager.default.moveItem(at: url, to: old)
+        }
+        let line = Data("\(logTimestamp.string(from: Date())) \(message)\n".utf8)
+        if let handle = try? FileHandle(forWritingTo: url) { handle.seekToEndOfFile(); handle.write(line); try? handle.close() }
+        else { try? line.write(to: url) }
+    }
 }
+
+func elapsed(_ start: Date) -> String { String(format: "%.1f", Date().timeIntervalSince(start)) }
 
 enum OCRError: Error { case busy, timeout }
 
@@ -470,14 +442,13 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         queue.async {
             _ = Self.recognize(image, minConfidence: 0)
             self.lock.lock(); self.busy = false; self.isWarm = true; self.lock.unlock()
-            appLog("OCR 暖機完成，耗時 \(String(format: "%.1f", Date().timeIntervalSince(start))) 秒")
+            appLog("OCR 暖機完成，耗時 \(elapsed(start)) 秒")
         }
     }
 
     func recognize(_ image: CGImage, minConfidence: Float, timeout: TimeInterval) async -> Result<[OCRTextBox], OCRError> {
         let acquired = lock.withLock { () -> Bool in if busy { return false }; busy = true; return true }
         guard acquired else { return .failure(.busy) }
-        let plain = image
         return await withCheckedContinuation { continuation in
             let once = NSLock(); var resumed = false
             let finish: (Result<[OCRTextBox], OCRError>) -> Void = { result in
@@ -485,7 +456,7 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
                 guard !resumed else { return }; resumed = true; continuation.resume(returning: result)
             }
             queue.async {
-                let boxes = Self.recognize(plain, minConfidence: minConfidence)
+                let boxes = Self.recognize(image, minConfidence: minConfidence)
                 self.lock.lock(); self.busy = false; self.isWarm = true; self.lock.unlock()
                 finish(.success(boxes))
             }
@@ -493,67 +464,59 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
         }
     }
 
-    private static func describe(_ image: CGImage) -> String {
-        "\(image.width)x\(image.height) bpc=\(image.bitsPerComponent) bpp=\(image.bitsPerPixel) info=\(image.bitmapInfo.rawValue) cs=\((image.colorSpace?.name as String?) ?? "nil")"
-    }
-
     // 一段辨識結果（可在子程序與主程序之間以 JSON 傳遞）
     struct Line: Codable { let text: String; let confidence: Float; let x, y, w, h: Double }
 
-    static func performInProcess(_ image: CGImage) -> Result<[Line], Error> {
+    static func performInProcess(_ image: CGImage) throws -> [Line] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate; request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US", "ja-JP", "zh-Hant", "zh-Hans", "ko-KR"]
-        do { try VNImageRequestHandler(cgImage: image, options: [:]).perform([request]) }
-        catch { return .failure(error) }
-        return .success((request.results ?? []).compactMap { obs in
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        return (request.results ?? []).compactMap { obs in
             guard let top = obs.topCandidates(1).first else { return nil }
             let b = obs.boundingBox
             return Line(text: top.string, confidence: top.confidence, x: b.minX, y: b.minY, w: b.width, h: b.height)
-        })
+        }
     }
 
     // Vision 在長時間執行（例如睡眠喚醒）後，本程序內有時會失敗（CRImageReaderError），但新開的程序可以正常辨識。
     // 因此每次先在本程序辨識，失敗時改用子程序，不必重開 App。環境變數供測試用。
     private static let forceHelper = ProcessInfo.processInfo.environment["ST_FORCE_OCR_HELPER"] == "1"
 
-    private static func performInHelper(_ image: CGImage) -> Result<[Line], Error> {
+    private static func performInHelper(_ image: CGImage) throws -> [Line] {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("st-ocr-\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: url) }
-        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { return .failure(TranslationError("無法建立暫存影像")) }
+        guard let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else { throw TranslationError("無法建立暫存影像") }
         CGImageDestinationAddImage(dest, image, nil)
-        guard CGImageDestinationFinalize(dest), let exe = Bundle.main.executableURL else { return .failure(TranslationError("無法寫入暫存影像")) }
+        guard CGImageDestinationFinalize(dest), let exe = Bundle.main.executableURL else { throw TranslationError("無法寫入暫存影像") }
         let task = Process(); task.executableURL = exe; task.arguments = ["--ocr-helper", url.path]
         let out = Pipe(); task.standardOutput = out; task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return .failure(error) }
+        try task.run()
+        // 子程序卡住時強制結束，否則辨識佇列會一直被占用（第一次準備模型約需 35 秒）
+        DispatchQueue.global().asyncAfter(deadline: .now() + 90) { if task.isRunning { task.terminate() } }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
         guard task.terminationStatus == 0, let lines = try? JSONDecoder().decode([Line].self, from: data) else {
-            return .failure(TranslationError("子程序辨識失敗（代碼 \(task.terminationStatus)）"))
+            throw TranslationError("子程序結束代碼 \(task.terminationStatus)")
         }
-        return .success(lines)
+        return lines
     }
 
     private static func recognize(_ input: CGImage, minConfidence: Float) -> [OCRTextBox] {
-        let image = plainCopy(of: input, scale: 1) ?? input // 統一成 8 位元 sRGB，顏色取樣與子程序都用這張
+        let pixels = PixelBuffer(input)
+        let image = pixels?.image ?? input // 辨識、顏色取樣與子程序都用同一張 sRGB 複本
         var lines: [Line] = []
-        var useHelper = forceHelper
-        if !useHelper {
-            switch performInProcess(image) {
-            case .success(let result): lines = result
-            case .failure(let error):
-                appLog("OCR 失敗（\(describe(image))）：\(error.localizedDescription)，改用子程序辨識")
-                useHelper = true
-            }
-        }
-        if useHelper {
+        do {
+            if forceHelper { throw TranslationError("測試：強制使用子程序") }
+            lines = try performInProcess(image)
+        } catch {
+            appLog("OCR 失敗（\(image.width)x\(image.height)）：\(error.localizedDescription)，改用子程序辨識")
             let start = Date()
-            switch performInHelper(image) {
-            case .success(let result): lines = result; appLog("子程序辨識完成，耗時 \(String(format: "%.1f", Date().timeIntervalSince(start))) 秒")
-            case .failure(let error): appLog("子程序辨識失敗：\(error.localizedDescription)")
+            for attempt in 1...2 { // 新安裝的版本第一次呼叫 Vision 偶爾會失敗，再試一次
+                do { lines = try performInHelper(image); appLog("子程序辨識完成，耗時 \(elapsed(start)) 秒"); break }
+                catch { appLog("子程序辨識失敗（第 \(attempt) 次）：\(error.localizedDescription)") }
             }
         }
-        let pixels = PixelBuffer(image)
         return lines.compactMap { line in
             guard line.confidence >= minConfidence else { return nil }
             let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -563,18 +526,6 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
             if let colors = pixels?.colors(for: rect) { box.background = colors.background; box.foreground = colors.foreground }
             return box
         }
-    }
-
-    // 複製成 8 位元 sRGB、不透明的一般點陣圖（螢幕擷取的影像由 IOSurface 支撐，格式可能是 HDR 或廣色域）
-    private static func plainCopy(of image: CGImage, scale: CGFloat) -> CGImage? {
-        let w = max(1, Int(CGFloat(image.width) * scale)), h = max(1, Int(CGFloat(image.height) * scale))
-        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                                  space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
-        ctx.setFillColor(CGColor(gray: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
-        ctx.interpolationQuality = .high
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return ctx.makeImage()
     }
 
     private static func sampleImage() -> CGImage? {
@@ -601,13 +552,21 @@ class TransparentOverlayWindow: NSWindow {
 let brandGradient = LinearGradient(colors: [Color(red: 0.36, green: 0.33, blue: 0.98), Color(red: 0.62, green: 0.30, blue: 0.96), Color(red: 0.13, green: 0.74, blue: 0.93)],
                                    startPoint: .topLeading, endPoint: .bottomTrailing)
 
+enum OverlayStatus {
+    case loading(String), done(String), warning(String)
+}
+
 struct OverlayContentView: View {
-    let boxes: [OCRTextBox]; let windowSize: CGSize; let engineBadge: String; let isLoading: Bool
-    var loadingText = "正在辨識與翻譯…"
+    let boxes: [OCRTextBox]; let windowSize: CGSize; let status: OverlayStatus
     @ObservedObject var settings = SettingsManager.shared
 
-    private var shortBadge: String { engineBadge.count > 56 ? String(engineBadge.prefix(55)) + "…" : engineBadge }
-    private var isFallback: Bool { ["失敗", "未設定", "逾時", "仍在", "未偵測"].contains { engineBadge.contains($0) } }
+    private var isLoading: Bool { if case .loading = status { return true }; return false }
+    private var isWarning: Bool { if case .warning = status { return true }; return false }
+    private var message: String {
+        switch status {
+        case .loading(let text), .done(let text), .warning(let text): return text.count > 64 ? String(text.prefix(63)) + "…" : text
+        }
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -630,7 +589,8 @@ struct OverlayContentView: View {
     /// 框剛好蓋住原文；譯文比原文長時往右延伸，但不蓋到同一行右邊的下一段文字
     private var layouts: [BoxLayout] {
         let rects = boxes.map { convertVisionRect($0.normalizedRect, in: windowSize) }
-        return boxes.enumerated().map { i, box in
+        return boxes.enumerated().compactMap { i, box in
+            guard box.isTranslated else { return nil } // 譯文與原文相同（例如本來就是中文）就不蓋，保留原畫面
             let r = rects[i]
             let fontSize = min(max(r.height * 0.82, 9), 40)
             let padX: CGFloat = isInPlace ? 3 : 6, padY: CGFloat = isInPlace ? 1.5 : 3
@@ -669,13 +629,13 @@ struct OverlayContentView: View {
     private var statusBadge: some View {
         HStack(spacing: 8) {
             ZStack {
-                Circle().fill(isLoading ? AnyShapeStyle(brandGradient) : AnyShapeStyle(isFallback ? Color.orange.gradient : Color.green.gradient))
+                Circle().fill(isLoading ? AnyShapeStyle(brandGradient) : AnyShapeStyle(isWarning ? Color.orange.gradient : Color.green.gradient))
                     .frame(width: 22, height: 22)
                 if isLoading { ProgressView().controlSize(.small).scaleEffect(0.6).tint(.white) }
-                else { Image(systemName: isFallback ? "exclamationmark" : "checkmark").font(.system(size: 11, weight: .bold)).foregroundColor(.white) }
+                else { Image(systemName: isWarning ? "exclamationmark" : "checkmark").font(.system(size: 11, weight: .bold)).foregroundColor(.white) }
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text(isLoading ? loadingText : (boxes.isEmpty ? shortBadge : "已翻譯 · \(shortBadge)"))
+                Text(message)
                     .font(.system(size: 12.5, weight: .semibold, design: .rounded)).lineLimit(1)
                 if !isLoading {
                     Text("再按 \(settings.hotkeyPreset) 或 Esc 關閉").font(.system(size: 10.5)).foregroundStyle(.secondary)
@@ -936,8 +896,7 @@ struct PreferencesView: View {
                 Task {
                     let res = await TranslationService.shared.translateBatch(texts: ["Hello World"])
                     await MainActor.run {
-                        let ok = !res.usedEngineName.contains("失敗") && !res.usedEngineName.contains("未設定")
-                        settings.testStatus = "\(ok ? "✅" : "⚠️") 譯文：「\(res.results.first ?? "")」\n使用：\(res.usedEngineName)"
+                        settings.testStatus = "\(res.isFallback ? "⚠️" : "✅") 譯文：「\(res.texts.first ?? "")」\n使用：\(res.engineName)"
                         settings.isTesting = false
                     }
                 }
@@ -961,6 +920,7 @@ final class LaunchAtLogin: ObservableObject {
     static let shared = LaunchAtLogin()
     @Published private(set) var isEnabled = SMAppService.mainApp.status == .enabled
     @Published private(set) var needsApproval = SMAppService.mainApp.status == .requiresApproval
+    private var didLogStatus = false
 
     func set(_ enabled: Bool) {
         do {
@@ -972,7 +932,9 @@ final class LaunchAtLogin: ObservableObject {
 
     func refresh() {
         let status = SMAppService.mainApp.status
-        isEnabled = status == .enabled; needsApproval = status == .requiresApproval
+        let enabled = status == .enabled, approval = status == .requiresApproval
+        guard enabled != isEnabled || approval != needsApproval || !didLogStatus else { return }
+        didLogStatus = true; isEnabled = enabled; needsApproval = approval
         appLog("登入時啟動狀態：\(status.rawValue)")
     }
 
@@ -1097,7 +1059,7 @@ struct PermissionSection: View {
             permissions.screenNeedsRelaunch ? permissions.relaunch() : permissions.requestScreen()
         }
         PermissionRow(symbol: "accessibility", color: .blue, title: "輔助使用",
-                      detail: "用來偵測全域快捷鍵（Fn + C），允許後立即生效",
+                      detail: "用來偵測全域快捷鍵（\(SettingsManager.shared.hotkeyPreset)），允許後立即生效",
                       granted: permissions.accessibilityGranted, actionTitle: "允許") { permissions.requestAccessibility() }
     }
 }
@@ -1139,7 +1101,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalHotkeyMonitors()
         OCREngine.shared.warmUp()
         LaunchAtLogin.shared.enableByDefaultOnce()
-        SettingsManager.shared.migrateKeychainKeysIfNeeded()
         let permissions = PermissionManager.shared
         permissions.onAccessibilityGranted = { [weak self] in self?.installEventTap() }
         permissions.startMonitoring()
@@ -1320,54 +1281,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func hideOverlay() { captureGeneration += 1; overlayWindow?.orderOut(nil); overlayWindow = nil; isOverlayShowing = false; isProcessing = false }
 
+    /// 只有仍是同一次觸發時才更新畫面；非載入中的狀態代表這次流程結束
+    private func present(_ generation: Int, frame: NSRect, boxes: [OCRTextBox] = [], status: OverlayStatus) async {
+        await MainActor.run {
+            guard generation == self.captureGeneration else { return }
+            if self.overlayWindow == nil { self.overlayWindow = TransparentOverlayWindow(frame: frame) } else { self.overlayWindow?.setFrame(frame, display: true) }
+            self.overlayWindow?.contentView = NSHostingView(rootView: OverlayContentView(boxes: boxes, windowSize: frame.size, status: status))
+            self.overlayWindow?.orderFrontRegardless()
+            if case .loading = status { return }
+            self.isProcessing = false
+        }
+    }
+
     private func captureAndTranslateActiveWindow() {
-        guard !isProcessing else { return }; guard let activeApp = NSWorkspace.shared.frontmostApplication else { return }; let pid = activeApp.processIdentifier
+        guard !isProcessing, let activeApp = NSWorkspace.shared.frontmostApplication else { return }
+        let pid = activeApp.processIdentifier
         let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? NSScreen.main?.frame.height ?? 1080
         isProcessing = true; isOverlayShowing = true
         captureGeneration += 1; let generation = captureGeneration
         Task {
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let targetWindow = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && $0.frame.width > 120 && $0.frame.height > 120 }) else { await MainActor.run { self.hideOverlay() }; return }
-                let cgBounds = targetWindow.frame; let filter = SCContentFilter(desktopIndependentWindow: targetWindow); let config = SCStreamConfiguration()
-                let cocoaFrame = NSRect(x: cgBounds.origin.x, y: primaryScreenHeight - cgBounds.origin.y - cgBounds.height, width: cgBounds.width, height: cgBounds.height)
+                guard let targetWindow = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && $0.frame.width > 120 && $0.frame.height > 120 }) else {
+                    await MainActor.run { if generation == self.captureGeneration { self.hideOverlay() } }; return
+                }
+                let cgBounds = targetWindow.frame
+                let frame = NSRect(x: cgBounds.origin.x, y: primaryScreenHeight - cgBounds.origin.y - cgBounds.height, width: cgBounds.width, height: cgBounds.height)
                 // 以實際像素擷取 (Retina 為 2 倍)，文字辨識準確度大幅提升
-                let scale = await MainActor.run { NSScreen.screens.first(where: { $0.frame.intersects(cocoaFrame) })?.backingScaleFactor ?? 2.0 }
+                let scale = await MainActor.run { NSScreen.screens.first(where: { $0.frame.intersects(frame) })?.backingScaleFactor ?? 2.0 }
+                let config = SCStreamConfiguration()
                 config.width = Int(cgBounds.width * scale); config.height = Int(cgBounds.height * scale); config.showsCursor = false
                 // 固定擷取成標準 8 位元 sRGB，避免 HDR／廣色域的視窗讓 Vision 讀不了
                 config.pixelFormat = kCVPixelFormatType_32BGRA
                 config.colorSpaceName = CGColorSpace.sRGB
                 if #available(macOS 15.0, *) { config.captureDynamicRange = .SDR }
-                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                let loadingText = OCREngine.shared.isWarm ? "正在辨識與翻譯…" : "首次使用，正在準備文字辨識模型（約 30 秒）…"
-                await MainActor.run { guard generation == self.captureGeneration else { return }; self.showOverlayWindow(frame: cocoaFrame, boxes: [], engineName: "", isLoading: true, loadingText: loadingText) }
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: targetWindow), configuration: config)
+
+                let isWarm = OCREngine.shared.isWarm
+                await present(generation, frame: frame, status: .loading(isWarm ? "正在辨識與翻譯…" : "首次使用，正在準備文字辨識模型（約 30 秒）…"))
                 appLog("開始辨識 \(cgImage.width)x\(cgImage.height)")
                 let ocrStart = Date()
-                let recognizedBoxes: [OCRTextBox]
-                switch await OCREngine.shared.recognize(cgImage, minConfidence: Float(SettingsManager.shared.minTextConfidence), timeout: OCREngine.shared.isWarm ? 20 : 75) {
-                case .success(let boxes): recognizedBoxes = boxes
+                var boxes: [OCRTextBox]
+                switch await OCREngine.shared.recognize(cgImage, minConfidence: Float(SettingsManager.shared.minTextConfidence), timeout: isWarm ? 20 : 75) {
+                case .success(let recognized): boxes = recognized
                 case .failure(let error):
                     appLog("辨識未完成：\(error)")
-                    let message = error == .busy ? "文字辨識模型仍在準備中，請稍後再試" : "文字辨識逾時，請再按一次快捷鍵重試"
-                    await MainActor.run { guard generation == self.captureGeneration else { return }; self.showOverlayWindow(frame: cocoaFrame, boxes: [], engineName: message, isLoading: false); self.isProcessing = false }
+                    await present(generation, frame: frame, status: .warning(error == .busy ? "文字辨識模型仍在準備中，請稍後再試" : "文字辨識逾時，請再按一次快捷鍵重試"))
                     return
                 }
-                appLog("辨識完成：\(recognizedBoxes.count) 段文字，耗時 \(String(format: "%.1f", Date().timeIntervalSince(ocrStart))) 秒")
-                if recognizedBoxes.isEmpty {
-                    await MainActor.run { guard generation == self.captureGeneration else { return }; self.showOverlayWindow(frame: cocoaFrame, boxes: [], engineName: "未偵測到文字", isLoading: false); self.isProcessing = false }
-                    return
-                }
-                let sourceTexts = recognizedBoxes.map { $0.originalText }; let translateStart = Date(); let (translatedTexts, usedEngine) = await TranslationService.shared.translateBatch(texts: sourceTexts)
-                appLog("翻譯完成：\(usedEngine)，耗時 \(String(format: "%.1f", Date().timeIntervalSince(translateStart))) 秒")
-                let finalBoxes: [OCRTextBox] = recognizedBoxes.enumerated().map { (idx, box) in var newBox = box; if idx < translatedTexts.count { newBox.translatedText = translatedTexts[idx] }; return newBox }
-                await MainActor.run { guard generation == self.captureGeneration else { return }; self.showOverlayWindow(frame: cocoaFrame, boxes: finalBoxes, engineName: usedEngine, isLoading: false); self.isProcessing = false }
-            } catch { appLog("擷取失敗：\(error.localizedDescription)"); await MainActor.run { guard generation == self.captureGeneration else { return }; self.hideOverlay() } }
-        }
-    }
+                appLog("辨識完成：\(boxes.count) 段文字，耗時 \(elapsed(ocrStart)) 秒")
+                guard !boxes.isEmpty else { await present(generation, frame: frame, status: .warning("未偵測到文字")); return }
 
-    private func showOverlayWindow(frame: NSRect, boxes: [OCRTextBox], engineName: String, isLoading: Bool, loadingText: String = "正在辨識與翻譯…") {
-        if overlayWindow == nil { overlayWindow = TransparentOverlayWindow(frame: frame) } else { overlayWindow?.setFrame(frame, display: true) }
-        overlayWindow?.contentView = NSHostingView(rootView: OverlayContentView(boxes: boxes, windowSize: frame.size, engineBadge: engineName, isLoading: isLoading, loadingText: loadingText)); overlayWindow?.orderFrontRegardless()
+                let translateStart = Date()
+                let outcome = await TranslationService.shared.translateBatch(texts: boxes.map(\.originalText))
+                appLog("翻譯完成：\(outcome.engineName)，耗時 \(elapsed(translateStart)) 秒")
+                for (index, text) in outcome.texts.enumerated() where index < boxes.count { boxes[index].translatedText = text }
+                let status: OverlayStatus
+                if !boxes.contains(where: \.isTranslated) { status = .warning("譯文與原文相同，沒有需要顯示的翻譯") }
+                else if outcome.isFallback { status = .warning("已翻譯 · \(outcome.engineName)") }
+                else { status = .done("已翻譯 · \(outcome.engineName)") }
+                await present(generation, frame: frame, boxes: boxes, status: status)
+            } catch {
+                appLog("擷取失敗：\(error.localizedDescription)")
+                await MainActor.run { if generation == self.captureGeneration { self.hideOverlay() } }
+            }
+        }
     }
 
     @objc func openPreferences() {
@@ -1387,7 +1365,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--ocr-helper" {
     guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: CommandLine.arguments[2]) as CFURL, nil),
           let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-          case .success(let lines) = OCREngine.performInProcess(image),
+          let lines = try? OCREngine.performInProcess(image),
           let json = try? JSONEncoder().encode(lines) else { exit(1) }
     FileHandle.standardOutput.write(json)
     exit(0)
