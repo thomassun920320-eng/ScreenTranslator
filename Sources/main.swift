@@ -539,6 +539,8 @@ final class OCREngine: @unchecked Sendable { // 狀態皆由 lock 保護
     }
 }
 
+extension CGRect { var area: CGFloat { isNull ? 0 : width * height } }
+
 // MARK: - 4. 視窗介面與系統底層
 class TransparentOverlayWindow: NSWindow {
     init(frame: NSRect) {
@@ -1305,17 +1307,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let targetWindow = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.windowLayer == 0 && $0.frame.width > 120 && $0.frame.height > 120 }) else {
                     await MainActor.run { if generation == self.captureGeneration { self.hideOverlay() } }; return
                 }
-                let cgBounds = targetWindow.frame
+                // 擷取「視窗所在的螢幕區域」而不是視窗本身：列印對話框等附屬視窗單獨擷取時，
+                // 內容會被縮放，譯文位置就對不上。依螢幕區域擷取則畫面與座標必定一致。
+                guard let display = content.displays.max(by: { $0.frame.intersection(targetWindow.frame).area < $1.frame.intersection(targetWindow.frame).area }) else { throw TranslationError("找不到視窗所在的螢幕") }
+                let cgBounds = targetWindow.frame.intersection(display.frame)
+                guard cgBounds.width > 50, cgBounds.height > 50 else { throw TranslationError("視窗不在螢幕可見範圍內") }
                 let frame = NSRect(x: cgBounds.origin.x, y: primaryScreenHeight - cgBounds.origin.y - cgBounds.height, width: cgBounds.width, height: cgBounds.height)
+                let ownWindows = content.windows.filter { $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier }
+                let filter = SCContentFilter(display: display, excludingWindows: ownWindows)
                 // 以實際像素擷取 (Retina 為 2 倍)，文字辨識準確度大幅提升
-                let scale = await MainActor.run { NSScreen.screens.first(where: { $0.frame.intersects(frame) })?.backingScaleFactor ?? 2.0 }
+                let scale = CGFloat(filter.pointPixelScale)
                 let config = SCStreamConfiguration()
+                config.sourceRect = cgBounds.offsetBy(dx: -display.frame.minX, dy: -display.frame.minY)
                 config.width = Int(cgBounds.width * scale); config.height = Int(cgBounds.height * scale); config.showsCursor = false
                 // 固定擷取成標準 8 位元 sRGB，避免 HDR／廣色域的視窗讓 Vision 讀不了
                 config.pixelFormat = kCVPixelFormatType_32BGRA
                 config.colorSpaceName = CGColorSpace.sRGB
                 if #available(macOS 15.0, *) { config.captureDynamicRange = .SDR }
-                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: targetWindow), configuration: config)
+                let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
 
                 let isWarm = OCREngine.shared.isWarm
                 await present(generation, frame: frame, status: .loading(isWarm ? "正在辨識與翻譯…" : "首次使用，正在準備文字辨識模型（約 30 秒）…"))
